@@ -1,6 +1,67 @@
+import base64
+import binascii
+import re
 from datetime import datetime, timezone
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, computed_field, field_validator
+
+
+PHOTO_MEDIA_TYPES = ("image/png", "image/jpeg", "image/webp", "image/gif")
+
+# Kept under 1 MiB / (4/3) so a photo that passes here still fits inside the
+# 1 MiB body limit the web client's server actions impose once base64 inflates
+# it by a third.
+MAX_PHOTO_BYTES = 700 * 1024
+# Base64 grows by 4/3, so anything longer than this cannot decode under the cap.
+MAX_PHOTO_ENCODED_CHARS = (MAX_PHOTO_BYTES + 2) // 3 * 4
+
+# Leading bytes that must be present for the declared media type. Guards against
+# a caller labelling arbitrary base64 as an image.
+_MAGIC_NUMBERS: dict[str, tuple[bytes, ...]] = {
+    "image/png": (b"\x89PNG\r\n\x1a\n",),
+    "image/jpeg": (b"\xff\xd8\xff",),
+    "image/gif": (b"GIF87a", b"GIF89a"),
+    "image/webp": (b"RIFF",),
+}
+
+_PHOTO_DATA_URL = re.compile(r"data:(image/(?:png|jpeg|webp|gif));base64,([A-Za-z0-9+/]+={0,2})")
+
+_PHOTO_DESCRIPTION = (
+    "Profile photo as a base64 data URL, e.g. `data:image/png;base64,iVBORw0KGgo=`. "
+    "PNG, JPEG, WEBP, or GIF, up to 700 KB decoded, and the bytes must actually be "
+    "that format. `null` means the client should fall back to the contact's initials."
+)
+_PHOTO_EXAMPLE = "data:image/png;base64,iVBORw0KGgo="
+
+
+def _validated_photo(value: str | None) -> str | None:
+    """Accept only a small, well-formed image data URL."""
+    if value is None:
+        return None
+
+    match = _PHOTO_DATA_URL.fullmatch(value)
+    if match is None:
+        raise ValueError("photo must be a base64 data URL for a PNG, JPEG, WEBP, or GIF image")
+
+    media_type, encoded = match.group(1), match.group(2)
+
+    # Reject on the encoded length first: decoding an arbitrarily large payload
+    # just to measure it is the expensive path an attacker would aim for.
+    if len(encoded) > MAX_PHOTO_ENCODED_CHARS:
+        raise ValueError("photo must be 700 KB or smaller")
+
+    try:
+        decoded = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError("photo is not valid base64") from exc
+
+    if len(decoded) > MAX_PHOTO_BYTES:
+        raise ValueError("photo must be 700 KB or smaller")
+
+    if not decoded.startswith(_MAGIC_NUMBERS[media_type]):
+        raise ValueError(f"photo bytes are not a valid {media_type} image")
+
+    return value
 
 
 class ContactBase(BaseModel):
@@ -69,6 +130,12 @@ class ContactBase(BaseModel):
         description="Free-form notes about the contact. No length limit.",
         examples=["Met at the SF hackathon."],
     )
+    photo: str | None = Field(default=None, description=_PHOTO_DESCRIPTION, examples=[_PHOTO_EXAMPLE])
+
+    @field_validator("photo")
+    @classmethod
+    def _check_photo(cls, value: str | None) -> str | None:
+        return _validated_photo(value)
 
 
 _FULL_EXAMPLE = {
@@ -134,6 +201,12 @@ class ContactUpdate(BaseModel):
     postal_code: str | None = Field(default=None, max_length=20, description="New postal code.")
     country: str | None = Field(default=None, max_length=120, description="New country.")
     notes: str | None = Field(default=None, description="New notes; replaces the existing text.")
+    photo: str | None = Field(default=None, description=f"New photo. {_PHOTO_DESCRIPTION}")
+
+    @field_validator("photo")
+    @classmethod
+    def _check_photo(cls, value: str | None) -> str | None:
+        return _validated_photo(value)
 
 
 class ContactRead(ContactBase):

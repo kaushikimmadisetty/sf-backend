@@ -1,3 +1,7 @@
+import base64
+
+import pytest
+
 BASE = "/api/v1/contacts"
 
 
@@ -144,3 +148,68 @@ def test_delete_contact(client, payload):
 def test_root_lists_entrypoints(client):
     body = client.get("/").json()
     assert body["contacts"] == BASE
+
+
+# --- photo ----------------------------------------------------------------
+
+PNG_DATA_URL = (
+    "data:image/png;base64,"
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+)
+
+
+def test_photo_round_trips(client, payload):
+    created = client.post(BASE, json={**payload, "photo": PNG_DATA_URL})
+    assert created.status_code == 201
+    assert created.json()["photo"] == PNG_DATA_URL
+
+    contact_id = created.json()["id"]
+    assert client.get(f"{BASE}/{contact_id}").json()["photo"] == PNG_DATA_URL
+
+
+def test_photo_defaults_to_none(client, payload):
+    assert client.post(BASE, json=payload).json()["photo"] is None
+
+
+def test_put_without_photo_clears_it(client, payload):
+    """PUT is a full replace, so an omitted photo is cleared — the UI must resend it."""
+    contact_id = client.post(BASE, json={**payload, "photo": PNG_DATA_URL}).json()["id"]
+    response = client.put(f"{BASE}/{contact_id}", json=payload)
+    assert response.status_code == 200
+    assert response.json()["photo"] is None
+
+
+def test_patch_leaves_photo_untouched(client, payload):
+    contact_id = client.post(BASE, json={**payload, "photo": PNG_DATA_URL}).json()["id"]
+    response = client.patch(f"{BASE}/{contact_id}", json={"job_title": "Countess"})
+    assert response.status_code == 200
+    assert response.json()["photo"] == PNG_DATA_URL
+
+
+@pytest.mark.parametrize(
+    "photo",
+    [
+        "https://example.com/ada.png",  # not a data URL
+        "data:application/pdf;base64,JVBERi0=",  # not an image
+        "data:image/png;base64,not base64!",  # malformed payload
+    ],
+)
+def test_invalid_photo_is_rejected(client, payload, photo):
+    assert client.post(BASE, json={**payload, "photo": photo}).status_code == 422
+
+
+def test_oversized_photo_is_rejected(client, payload):
+    oversized = "data:image/png;base64," + base64.b64encode(b"\0" * (2 * 1024 * 1024 + 1)).decode()
+    assert client.post(BASE, json={**payload, "photo": oversized}).status_code == 422
+
+
+def test_photo_bytes_must_match_declared_type(client, payload):
+    """Base64 that decodes to something other than the declared image is rejected."""
+    not_an_image = "data:image/png;base64," + base64.b64encode(b"hello world").decode()
+    assert client.post(BASE, json={**payload, "photo": not_an_image}).status_code == 422
+
+
+def test_oversized_photo_is_rejected_without_decoding(client, payload):
+    """The encoded length is checked first, so a huge payload is never decoded."""
+    huge = "data:image/png;base64," + "A" * (4 * 1024 * 1024)
+    assert client.post(BASE, json={**payload, "photo": huge}).status_code == 422
