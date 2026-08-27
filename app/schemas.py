@@ -7,14 +7,29 @@ from pydantic import BaseModel, ConfigDict, EmailStr, Field, computed_field, fie
 
 
 PHOTO_MEDIA_TYPES = ("image/png", "image/jpeg", "image/webp", "image/gif")
-MAX_PHOTO_BYTES = 2 * 1024 * 1024
+
+# Kept under 1 MiB / (4/3) so a photo that passes here still fits inside the
+# 1 MiB body limit the web client's server actions impose once base64 inflates
+# it by a third.
+MAX_PHOTO_BYTES = 700 * 1024
+# Base64 grows by 4/3, so anything longer than this cannot decode under the cap.
+MAX_PHOTO_ENCODED_CHARS = (MAX_PHOTO_BYTES + 2) // 3 * 4
+
+# Leading bytes that must be present for the declared media type. Guards against
+# a caller labelling arbitrary base64 as an image.
+_MAGIC_NUMBERS: dict[str, tuple[bytes, ...]] = {
+    "image/png": (b"\x89PNG\r\n\x1a\n",),
+    "image/jpeg": (b"\xff\xd8\xff",),
+    "image/gif": (b"GIF87a", b"GIF89a"),
+    "image/webp": (b"RIFF",),
+}
 
 _PHOTO_DATA_URL = re.compile(r"data:(image/(?:png|jpeg|webp|gif));base64,([A-Za-z0-9+/]+={0,2})")
 
 _PHOTO_DESCRIPTION = (
     "Profile photo as a base64 data URL, e.g. `data:image/png;base64,iVBORw0KGgo=`. "
-    "PNG, JPEG, WEBP, or GIF, up to 2 MB decoded. `null` means the client should "
-    "fall back to the contact's initials."
+    "PNG, JPEG, WEBP, or GIF, up to 700 KB decoded, and the bytes must actually be "
+    "that format. `null` means the client should fall back to the contact's initials."
 )
 _PHOTO_EXAMPLE = "data:image/png;base64,iVBORw0KGgo="
 
@@ -28,13 +43,23 @@ def _validated_photo(value: str | None) -> str | None:
     if match is None:
         raise ValueError("photo must be a base64 data URL for a PNG, JPEG, WEBP, or GIF image")
 
+    media_type, encoded = match.group(1), match.group(2)
+
+    # Reject on the encoded length first: decoding an arbitrarily large payload
+    # just to measure it is the expensive path an attacker would aim for.
+    if len(encoded) > MAX_PHOTO_ENCODED_CHARS:
+        raise ValueError("photo must be 700 KB or smaller")
+
     try:
-        decoded = base64.b64decode(match.group(2), validate=True)
+        decoded = base64.b64decode(encoded, validate=True)
     except (binascii.Error, ValueError) as exc:
         raise ValueError("photo is not valid base64") from exc
 
     if len(decoded) > MAX_PHOTO_BYTES:
-        raise ValueError("photo must be 2 MB or smaller")
+        raise ValueError("photo must be 700 KB or smaller")
+
+    if not decoded.startswith(_MAGIC_NUMBERS[media_type]):
+        raise ValueError(f"photo bytes are not a valid {media_type} image")
 
     return value
 
